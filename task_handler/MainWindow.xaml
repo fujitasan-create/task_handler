@@ -21,24 +21,54 @@
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="120"/>
+                <ColumnDefinition Width="80"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
+            <!-- CPU -->
             <TextBlock Grid.Row="0" Grid.Column="0" Text="CPU 使用率:" />
             <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding CpuUsageText}" />
+            <ProgressBar Grid.Row="0" Grid.Column="2"
+                 Minimum="0" Maximum="100"
+                 Height="16"
+                 Value="{Binding CpuUsageValue}" />
 
+            <!-- メモリ -->
             <TextBlock Grid.Row="1" Grid.Column="0" Text="メモリ 使用率:" />
             <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding MemoryUsageText}" />
+            <ProgressBar Grid.Row="1" Grid.Column="2"
+                 Minimum="0" Maximum="100"
+                 Height="16"
+                 Value="{Binding MemoryUsageValue}" />
 
-            <TextBlock Grid.Row="2" Grid.Column="0" Text="GPU 使用率 (3D):" />
+            <!-- GPU -->
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="GPU 使用率:" />
             <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding GpuUsageText}" />
+            <ProgressBar Grid.Row="2" Grid.Column="2"
+                 Minimum="0" Maximum="100"
+                 Height="16"
+                 Value="{Binding GpuUsageValue}" />
 
+            <!-- Ping -->
             <TextBlock Grid.Row="3" Grid.Column="0" Text="Ping(8.8.8.8):" />
             <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding PingText}" />
 
+            <!-- 温度 -->
             <TextBlock Grid.Row="4" Grid.Column="0" Text="温度 (CPU/GPU):" />
-            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding TemperatureText}" />
+            <TextBlock Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Text="{Binding TemperatureText}" />
         </Grid>
+        <GroupBox Grid.Row="1" Margin="0,114,0,0" Header="Top Processes (by CPU / Mem / GPU)" Height="68" VerticalAlignment="Top">
+            <DataGrid ItemsSource="{Binding TopProcs}" AutoGenerateColumns="False" HeadersVisibility="Column"
+            CanUserAddRows="False" IsReadOnly="True" Height="140">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*"/>
+                    <DataGridTextColumn Header="PID" Binding="{Binding Pid}" Width="80"/>
+                    <DataGridTextColumn Header="CPU %" Binding="{Binding CpuPct, StringFormat=F1}" Width="80"/>
+                    <DataGridTextColumn Header="Mem MB" Binding="{Binding MemMB, StringFormat=F0}" Width="90"/>
+                    <DataGridTextColumn Header="GPU %" Binding="{Binding GpuPct, StringFormat=F1}" Width="80"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </GroupBox>
     </Grid>
 </Window>
