@@ -9,14 +9,16 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;    // ← 追加
 using System.Timers;
-using System.Windows; // Dispatcher 用（WPF）
+using System.Windows;           // Dispatcher 用（WPF）
+using LibreHardwareMonitor.Hardware;
 
 namespace task_handler
 {
     public class MetricsViewModel : INotifyPropertyChanged, IDisposable
     {
-        // ==== 公開用プロパティ（XAMLバインド用）====
+        // ==== 公開プロパティ ====
         private string _cpuUsageText = "-- %";
         public string CpuUsageText { get => _cpuUsageText; set { _cpuUsageText = value; OnPropertyChanged(); } }
 
@@ -41,7 +43,7 @@ namespace task_handler
         private float _gpuUsageValue;
         public float GpuUsageValue { get => _gpuUsageValue; set { _gpuUsageValue = value; OnPropertyChanged(); } }
 
-        // Topプロセス表示用
+        // Topプロセス用
         public class ProcRow
         {
             public string Name { get; set; } = "";
@@ -60,15 +62,16 @@ namespace task_handler
         private readonly Ping _ping = new();
         private readonly Queue<long> _lat = new();
         private readonly int _latWindow = 10;
+        private const int TOP_ROWS = 30;
 
-        // GPU（合計用）
+        // GPU（合計）
         private readonly List<PerformanceCounter> _gpuCounters = new();
 
         // Topプロセス計測
         private readonly Dictionary<int, (TimeSpan cpuTime, DateTime ts)> _prevCpu = new();
         private readonly int _logicalProcessorCount = Environment.ProcessorCount;
 
-        // GPU（プロセス別用）
+        // GPU（プロセス別）
         private readonly List<PerformanceCounter> _gpuPerEngine = new();
         private readonly Regex _pidRegex = new(@"pid_(\d+)", RegexOptions.Compiled);
 
@@ -79,13 +82,18 @@ namespace task_handler
         // GPUのPID別集計スイッチ（重い環境は false 推奨）
         private const bool ENABLE_GPU_PER_PROCESS = false;
 
-        // ==== ctor ====
+        // ==== 温度（LibreHardwareMonitor） ====
+        private Computer? _pc;                 // LHM本体
+        private ISensor? _cpuTempSensor;       // 代表CPU温度
+        private ISensor? _gpuTempSensor;       // 代表GPU温度
+        private DateTime _lastTempScan = DateTime.MinValue;
+
         public MetricsViewModel()
         {
-            // CPUカウンタは初回0%になりがち → ウォームアップ
+            // CPUカウンタのウォームアップ
             _ = _cpuTotal.NextValue();
 
-            // GPUカウンタ列挙（3Dエンジン合計）
+            // GPUカウンタ列挙（3D合算）
             try
             {
                 var cat = new PerformanceCounterCategory("GPU Engine");
@@ -96,14 +104,30 @@ namespace task_handler
                     {
                         var pc = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, true);
                         _gpuCounters.Add(pc);
-                        _ = pc.NextValue(); // ウォームアップ
+                        _ = pc.NextValue();
                     }
                     catch { }
                 }
             }
             catch { /* 環境によっては存在しない */ }
 
-            // タイマー（1.5秒ごと／AutoReset）
+            // ★ 温度：LHM初期化（EC/コントローラも有効化）
+            try
+            {
+                _pc = new Computer
+                {
+                    IsCpuEnabled = true,
+                    IsGpuEnabled = true,
+                    IsMotherboardEnabled = true,
+                    IsControllerEnabled = true,   // ← 追加：EC経由の温度対策
+                    IsMemoryEnabled = true        // （お好み。将来の拡張用）
+                };
+                _pc.Open();
+                RefreshTempSensors(); // 一度センサーを見つけておく
+            }
+            catch { /* 失敗したら温度は "--" 表示のまま */ }
+
+            // タイマー
             _timer = new System.Timers.Timer(1500);
             _timer.Elapsed += async (_, __) => await OnTimerAsync();
             _timer.AutoReset = true;
@@ -113,7 +137,7 @@ namespace task_handler
         // ==== タイマー処理（再入防止＋間引き）====
         private async Task OnTimerAsync()
         {
-            if (!await _tickGate.WaitAsync(0)) return; // 処理中ならスキップ
+            if (!await _tickGate.WaitAsync(0)) return;
             try
             {
                 _tickCount++;
@@ -123,7 +147,7 @@ namespace task_handler
                 UpdateMemory();
                 await UpdatePingAsync();
 
-                // GPUトータルは2回に1回
+                // GPU合計は2回に1回
                 if (_tickCount % 2 == 0)
                     UpdateGpu();
 
@@ -133,6 +157,10 @@ namespace task_handler
                     if (ENABLE_GPU_PER_PROCESS) UpdateTopProcesses();
                     else UpdateTopProcesses_NoGpu();
                 }
+
+                // 温度は4回に1回（約6秒ごと）
+                if (_tickCount % 4 == 0)
+                    UpdateTemperatures();
             }
             finally
             {
@@ -168,11 +196,12 @@ namespace task_handler
             {
                 try { sum += pc.NextValue(); } catch { }
             }
-            sum = Math.Clamp(sum, 0f, 100f); // クリップ
+            sum = Math.Clamp(sum, 0f, 100f);
             GpuUsageText = $"{sum:F1} %";
             GpuUsageValue = sum;
         }
 
+        // ==== Ping ====
         private async Task UpdatePingAsync()
         {
             try
@@ -189,13 +218,139 @@ namespace task_handler
             }
         }
 
-        private void UpdateTemperatures()
+        // ==== 温度ロジック ====
+        private static bool IsSensibleTemp(float? v) => v.HasValue && v.Value > 5f && v.Value < 110f;
+
+        // 全デバイス/サブデバイスを更新
+        private void UpdateAllHardware()
         {
-            // LibreHardwareMonitor 導入後に実装する想定
-            // TemperatureText = $"CPU: {cpuTemp:F0} °C / GPU: {gpuTemp:F0} °C";
+            if (_pc == null) return;
+            foreach (var hw in _pc.Hardware)
+            {
+                hw.Update();
+                foreach (var sub in hw.SubHardware) sub.Update();
+            }
         }
 
-        // ==== Topプロセス（GPU あり）====
+        private static readonly string[] CpuTempPrefer =
+            { "Package", "Tctl", "Tdie", "Core (Tctl/Tdie)", "Core Max", "CPU Die", "CCD", "CPU" };
+        private static readonly string[] GpuTempPrefer =
+            { "Hot Spot", "GPU Core", "GPU" };
+
+        private ISensor? PickBestByNameThenMax(IEnumerable<ISensor> sensors, string[] prefer)
+        {
+            // 名前優先（妥当値）→ それ以外は妥当値の最大
+            foreach (var kw in prefer)
+            {
+                var s = sensors.FirstOrDefault(x =>
+                    x.SensorType == SensorType.Temperature &&
+                    (x.Name?.IndexOf(kw, StringComparison.OrdinalIgnoreCase) ?? -1) >= 0 &&
+                    IsSensibleTemp(x.Value));
+                if (s != null) return s;
+            }
+            return sensors
+                .Where(x => x.SensorType == SensorType.Temperature && IsSensibleTemp(x.Value))
+                .OrderByDescending(x => x.Value ?? float.MinValue)
+                .FirstOrDefault();
+        }
+
+        private void RefreshTempSensors()
+        {
+            if (_pc == null) return;
+
+            UpdateAllHardware();
+
+            // CPU候補: (1) CPU配下 (2) マザボ(SuperIO/EC)配下の「CPU/Package/Tctl/Tdie」系
+            var cpuCandidates = new List<ISensor>();
+
+            foreach (var cpuHw in _pc.Hardware.Where(h => h.HardwareType == HardwareType.Cpu))
+                cpuCandidates.AddRange(cpuHw.Sensors);
+
+            var mb = _pc.Hardware.FirstOrDefault(h => h.HardwareType == HardwareType.Motherboard);
+            if (mb != null)
+            {
+                foreach (var sub in mb.SubHardware)
+                {
+                    sub.Update();
+                    foreach (var s in sub.Sensors)
+                    {
+                        if (s.SensorType != SensorType.Temperature) continue;
+                        var n = s.Name ?? "";
+                        if (n.IndexOf("CPU", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n.IndexOf("Package", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n.IndexOf("Tctl", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n.IndexOf("Tdie", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            cpuCandidates.Add(s);
+                        }
+                    }
+                }
+            }
+
+            // 最後の手段：マザボ温度の中で妥当な最大（CPUらしき温度が1つも見つからない場合）
+            if (cpuCandidates.Count == 0 && mb != null)
+            {
+                var allMbTemps = new List<ISensor>();
+                foreach (var sub in mb.SubHardware)
+                {
+                    sub.Update();
+                    allMbTemps.AddRange(sub.Sensors.Where(s => s.SensorType == SensorType.Temperature));
+                }
+                var fallback = allMbTemps.Where(s => IsSensibleTemp(s.Value))
+                                         .OrderByDescending(s => s.Value ?? float.MinValue)
+                                         .FirstOrDefault();
+                if (fallback != null) cpuCandidates.Add(fallback);
+            }
+
+            _cpuTempSensor = PickBestByNameThenMax(cpuCandidates, CpuTempPrefer);
+
+            // GPU候補: GPUデバイス配下
+            var gpuCandidates = new List<ISensor>();
+            foreach (var gpuHw in _pc.Hardware.Where(h =>
+                h.HardwareType == HardwareType.GpuNvidia ||
+                h.HardwareType == HardwareType.GpuAmd ||
+                h.HardwareType == HardwareType.GpuIntel))
+            {
+                gpuCandidates.AddRange(gpuHw.Sensors);
+            }
+            _gpuTempSensor = PickBestByNameThenMax(gpuCandidates, GpuTempPrefer);
+
+            _lastTempScan = DateTime.UtcNow;
+        }
+
+        private static float? ReadSensorTemp(ISensor? s)
+        {
+            if (s == null) return null;
+            try
+            {
+                s.Hardware.Update();
+                foreach (var sub in s.Hardware.SubHardware) sub.Update();
+                var v = s.Value;
+                return IsSensibleTemp(v) ? v : (float?)null;
+            }
+            catch { return null; }
+        }
+
+        private void UpdateTemperatures()
+        {
+            if (_pc == null) return;
+
+            // スリープ復帰やGPU切替対策：30秒に1回はセンサーを取り直し
+            if ((DateTime.UtcNow - _lastTempScan).TotalSeconds > 30)
+                RefreshTempSensors();
+
+            UpdateAllHardware();
+
+            var cpu = ReadSensorTemp(_cpuTempSensor);
+            if (!cpu.HasValue) { RefreshTempSensors(); cpu = ReadSensorTemp(_cpuTempSensor); }
+
+            var gpu = ReadSensorTemp(_gpuTempSensor);
+
+            TemperatureText =
+                $"CPU: {(cpu?.ToString("F0") ?? "--")} °C / GPU: {(gpu?.ToString("F0") ?? "--")} °C";
+        }
+
+        // ==== Topプロセス（GPUあり）====
         private void EnsureGpuPerEngineCounters()
         {
             if (_gpuPerEngine.Count > 0) return;
@@ -213,10 +368,8 @@ namespace task_handler
                     }
                     catch { }
                 }
-
-                // 安全弁：多すぎると重いので諦める
                 if (_gpuPerEngine.Count > 200)
-                    _gpuPerEngine.Clear();
+                    _gpuPerEngine.Clear(); // 安全弁：多すぎる環境は諦める
             }
             catch { }
         }
@@ -227,7 +380,6 @@ namespace task_handler
             {
                 EnsureGpuPerEngineCounters();
 
-                // GPU% を pid ごとに合算
                 var gpuByPid = new Dictionary<int, float>();
                 foreach (var pc in _gpuPerEngine)
                 {
@@ -251,7 +403,6 @@ namespace task_handler
                 {
                     try
                     {
-                        // CPU%
                         var cpu = p.TotalProcessorTime;
                         float cpuPct = 0f;
                         if (_prevCpu.TryGetValue(p.Id, out var prev))
@@ -265,10 +416,7 @@ namespace task_handler
                         }
                         _prevCpu[p.Id] = (cpu, now);
 
-                        // Mem(MB)
                         float memMB = p.WorkingSet64 / (1024f * 1024f);
-
-                        // GPU%
                         gpuByPid.TryGetValue(p.Id, out float gpuPct);
 
                         rows.Add(new ProcRow
@@ -287,7 +435,7 @@ namespace task_handler
                     .OrderByDescending(r => r.CpuPct)
                     .ThenByDescending(r => r.GpuPct)
                     .ThenByDescending(r => r.MemMB)
-                    .Take(5)
+                    .Take(TOP_ROWS)
                     .ToList();
 
                 Application.Current.Dispatcher.Invoke(() =>
@@ -296,7 +444,6 @@ namespace task_handler
                     foreach (var r in top) TopProcs.Add(r);
                 });
 
-                // 終了したPIDのキャッシュ掃除
                 var alive = new HashSet<int>(procs.Select(p => p.Id));
                 var dead = _prevCpu.Keys.Where(pid => !alive.Contains(pid)).ToList();
                 foreach (var d in dead) _prevCpu.Remove(d);
@@ -304,7 +451,7 @@ namespace task_handler
             catch { }
         }
 
-        // ==== Topプロセス（GPU なしの軽量版）====
+        // ==== Topプロセス（GPUなし軽量版）====
         private void UpdateTopProcesses_NoGpu()
         {
             try
@@ -347,7 +494,7 @@ namespace task_handler
                 var top = rows
                     .OrderByDescending(r => r.CpuPct)
                     .ThenByDescending(r => r.MemMB)
-                    .Take(5)
+                    .Take(TOP_ROWS)
                     .ToList();
 
                 Application.Current.Dispatcher.Invoke(() =>
@@ -363,7 +510,7 @@ namespace task_handler
             catch { }
         }
 
-        // ==== メモリ（GlobalMemoryStatusEx）====
+        // ==== メモリ ====
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private struct MEMORYSTATUSEX
         {
@@ -406,6 +553,8 @@ namespace task_handler
             foreach (var pc in _gpuCounters) pc.Dispose();
             foreach (var pc in _gpuPerEngine) pc.Dispose();
             _ping?.Dispose();
+
+            try { _pc?.Close(); } catch { }
         }
     }
 }
