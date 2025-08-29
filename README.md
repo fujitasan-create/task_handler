@@ -5,6 +5,8 @@ Windows用の軽量システムモニターです。
 
 CPU/GPU/メモリ使用率、Ping、CPU/GPU温度、上位プロセス（CPU/Mem/GPU）を表示します。
 
+<img width="615" height="502" alt="image" src="https://github.com/user-attachments/assets/6b81ec10-d2a6-43d1-aa9a-9c5c12009753" />
+
 ---
 
 ## 動作環境
