@@ -1,0 +1,44 @@
+﻿<Window x:Class="task_handler.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Task Handler+" Height="300" Width="520"
+        FontFamily="Segoe UI" FontSize="14">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="System Monitor (prototype)"
+                   FontSize="18" FontWeight="Bold" />
+
+        <Grid Grid.Row="1" Margin="0,12,0,0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="180"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="CPU 使用率:" />
+            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding CpuUsageText}" />
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="メモリ 使用率:" />
+            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding MemoryUsageText}" />
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="GPU 使用率 (3D):" />
+            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding GpuUsageText}" />
+
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Ping(8.8.8.8):" />
+            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding PingText}" />
+
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="温度 (CPU/GPU):" />
+            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding TemperatureText}" />
+        </Grid>
+    </Grid>
+</Window>
