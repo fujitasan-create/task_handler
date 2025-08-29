@@ -1,21 +1,22 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using System.Threading;
 using System.Timers;
-using System.Diagnostics;
-using System.Collections.ObjectModel;      
-using System.Text.RegularExpressions;      
-
+using System.Windows; // Dispatcher 用（WPF）
 
 namespace task_handler
 {
     public class MetricsViewModel : INotifyPropertyChanged, IDisposable
     {
-        // ==== 公開用プロパティ（XAMLとバインド）====
+        // ==== 公開用プロパティ（XAMLバインド用）====
         private string _cpuUsageText = "-- %";
         public string CpuUsageText { get => _cpuUsageText; set { _cpuUsageText = value; OnPropertyChanged(); } }
 
@@ -40,6 +41,7 @@ namespace task_handler
         private float _gpuUsageValue;
         public float GpuUsageValue { get => _gpuUsageValue; set { _gpuUsageValue = value; OnPropertyChanged(); } }
 
+        // Topプロセス表示用
         public class ProcRow
         {
             public string Name { get; set; } = "";
@@ -48,148 +50,42 @@ namespace task_handler
             public float MemMB { get; set; }
             public float GpuPct { get; set; }
         }
-
         public ObservableCollection<ProcRow> TopProcs { get; } = new();
 
-        // ==== 内部 ====
+        // ==== 内部フィールド ====
         private readonly PerformanceCounter _cpuTotal =
             new("Processor", "% Processor Time", "_Total", true);
 
-        private readonly System.Timers.Timer _timer;            
+        private readonly System.Timers.Timer _timer;
         private readonly Ping _ping = new();
         private readonly Queue<long> _lat = new();
         private readonly int _latWindow = 10;
 
-        // GPU Engine カウンタキャッシュ
+        // GPU（合計用）
         private readonly List<PerformanceCounter> _gpuCounters = new();
 
-        // --- Topプロセス計測に使うフィールド ---
+        // Topプロセス計測
         private readonly Dictionary<int, (TimeSpan cpuTime, DateTime ts)> _prevCpu = new();
         private readonly int _logicalProcessorCount = Environment.ProcessorCount;
 
-        // GPU Engine の各エンジン（pid付き）を列挙してPIDごと集計する
+        // GPU（プロセス別用）
         private readonly List<PerformanceCounter> _gpuPerEngine = new();
         private readonly Regex _pidRegex = new(@"pid_(\d+)", RegexOptions.Compiled);
 
-        private void EnsureGpuPerEngineCounters()
-        {
-            if (_gpuPerEngine.Count > 0) return;
-            try
-            {
-                var cat = new PerformanceCounterCategory("GPU Engine");
-                foreach (var inst in cat.GetInstanceNames())
-                {
-                    if (!inst.Contains("engtype_3D")) continue; // 3Dだけ合算
-                    try
-                    {
-                        var pc = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, true);
-                        _gpuPerEngine.Add(pc);
-                        _ = pc.NextValue(); // ウォームアップ
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-        }
+        // 再入防止＆間引き
+        private readonly SemaphoreSlim _tickGate = new(1, 1);
+        private int _tickCount = 0;
 
-        private void UpdateTopProcesses()
-        {
-            try
-            {
-                EnsureGpuPerEngineCounters();
+        // GPUのPID別集計スイッチ（重い環境は false 推奨）
+        private const bool ENABLE_GPU_PER_PROCESS = false;
 
-                // --- GPU% を pid ごとに合算 ---
-                var gpuByPid = new Dictionary<int, float>();
-                foreach (var pc in _gpuPerEngine)
-                {
-                    try
-                    {
-                        float v = pc.NextValue();
-                        var m = _pidRegex.Match(pc.InstanceName);
-                        if (!m.Success) continue;
-                        int pid = int.Parse(m.Groups[1].Value);
-                        if (!gpuByPid.ContainsKey(pid)) gpuByPid[pid] = 0f;
-                        gpuByPid[pid] += v;
-                    }
-                    catch { }
-                }
-
-                // --- 全プロセス列挙 & CPU/メモリ計算 ---
-                var now = DateTime.UtcNow;
-                var procs = Process.GetProcesses();
-                var rows = new List<ProcRow>(procs.Length);
-
-                foreach (var p in procs)
-                {
-                    try
-                    {
-                        // CPU%（直近区間の差分）
-                        var cpu = p.TotalProcessorTime;
-                        float cpuPct = 0f;
-                        if (_prevCpu.TryGetValue(p.Id, out var prev))
-                        {
-                            var dt = (float)(now - prev.ts).TotalSeconds;
-                            if (dt > 0.2f)
-                            {
-                                var dcpu = (float)(cpu - prev.cpuTime).TotalSeconds;
-                                cpuPct = Math.Clamp((dcpu / dt) * 100f / _logicalProcessorCount, 0f, 1000f);
-                            }
-                        }
-                        _prevCpu[p.Id] = (cpu, now);
-
-                        // メモリ(MB)
-                        float memMB = p.WorkingSet64 / (1024f * 1024f);
-
-                        // GPU%
-                        gpuByPid.TryGetValue(p.Id, out float gpuPct);
-
-                        rows.Add(new ProcRow
-                        {
-                            Name = string.IsNullOrEmpty(p.ProcessName) ? "(unknown)" : p.ProcessName,
-                            Pid = p.Id,
-                            CpuPct = cpuPct,
-                            MemMB = memMB,
-                            GpuPct = gpuPct
-                        });
-                    }
-                    catch
-                    {
-                        // アクセス拒否・終了したプロセス等はスキップ
-                    }
-                }
-
-                // 上位5件（CPU優先 → GPU → Mem）
-                var top = rows
-                    .OrderByDescending(r => r.CpuPct)
-                    .ThenByDescending(r => r.GpuPct)
-                    .ThenByDescending(r => r.MemMB)
-                    .Take(5)
-                    .ToList();
-
-                // タイマースレッド→UIスレッドにマーシャル
-                System.Windows.Application.Current.Dispatcher.Invoke(() =>
-                {
-                    TopProcs.Clear();
-                    foreach (var r in top) TopProcs.Add(r);
-                });
-
-                // 終了したPIDのキャッシュ掃除
-                var alive = new HashSet<int>(procs.Select(p => p.Id));
-                var dead = _prevCpu.Keys.Where(pid => !alive.Contains(pid)).ToList();
-                foreach (var d in dead) _prevCpu.Remove(d);
-            }
-            catch { }
-        }
-
-        // LibreHardwareMonitor を使うなら後で初期化（NuGet入れた後で）
-        // private readonly LibreHardwareMonitor.Hardware.Computer _pc;
-
+        // ==== ctor ====
         public MetricsViewModel()
         {
-            // CPUカウンタは最初の1回は0%になりがち → ウォームアップ
+            // CPUカウンタは初回0%になりがち → ウォームアップ
             _ = _cpuTotal.NextValue();
 
-            // GPUカウンタ列挙(3Dエンジン合算)
+            // GPUカウンタ列挙（3Dエンジン合計）
             try
             {
                 var cat = new PerformanceCounterCategory("GPU Engine");
@@ -202,41 +98,49 @@ namespace task_handler
                         _gpuCounters.Add(pc);
                         _ = pc.NextValue(); // ウォームアップ
                     }
-                    catch { /* 無視 */ }
+                    catch { }
                 }
             }
-            catch
-            {
-                // Windowsやドライバによって存在しない場合あり
-            }
+            catch { /* 環境によっては存在しない */ }
 
-            _timer = new System.Timers.Timer(1000);
-            _timer.Elapsed += async (_, __) => await TickAsync();
+            // タイマー（1.5秒ごと／AutoReset）
+            _timer = new System.Timers.Timer(1500);
+            _timer.Elapsed += async (_, __) => await OnTimerAsync();
             _timer.AutoReset = true;
             _timer.Start();
-
-            // ▼ 温度を入れるなら（あとでNuGet導入後にコメント解除）
-            // _pc = new LibreHardwareMonitor.Hardware.Computer { IsCpuEnabled = true, IsGpuEnabled = true };
-            // _pc.Open();
         }
 
-        private async Task TickAsync()
+        // ==== タイマー処理（再入防止＋間引き）====
+        private async Task OnTimerAsync()
         {
+            if (!await _tickGate.WaitAsync(0)) return; // 処理中ならスキップ
             try
             {
+                _tickCount++;
+
+                // 軽い処理は毎回
                 UpdateCpu();
                 UpdateMemory();
-                UpdateGpu();
                 await UpdatePingAsync();
-                UpdateTemperatures(); // LibreHardwareMonitor 導入後に実装
-                UpdateTopProcesses();
+
+                // GPUトータルは2回に1回
+                if (_tickCount % 2 == 0)
+                    UpdateGpu();
+
+                // Topプロセスは3回に1回
+                if (_tickCount % 3 == 0)
+                {
+                    if (ENABLE_GPU_PER_PROCESS) UpdateTopProcesses();
+                    else UpdateTopProcesses_NoGpu();
+                }
             }
-            catch
+            finally
             {
-                // ここでUIが固まらないように握りつぶし
+                _tickGate.Release();
             }
         }
 
+        // ==== 個別更新 ====
         private void UpdateCpu()
         {
             float v = _cpuTotal.NextValue();
@@ -256,6 +160,7 @@ namespace task_handler
             if (_gpuCounters.Count == 0)
             {
                 GpuUsageText = "N/A";
+                GpuUsageValue = 0;
                 return;
             }
             float sum = 0f;
@@ -263,8 +168,7 @@ namespace task_handler
             {
                 try { sum += pc.NextValue(); } catch { }
             }
-            // 複数エンジン合計。100%を超える場合があるのでクリップ
-            sum = Math.Clamp(sum, 0f, 100f);
+            sum = Math.Clamp(sum, 0f, 100f); // クリップ
             GpuUsageText = $"{sum:F1} %";
             GpuUsageValue = sum;
         }
@@ -287,11 +191,179 @@ namespace task_handler
 
         private void UpdateTemperatures()
         {
-            // ひとまずダミー。LibreHardwareMonitor を入れたら実装に置き換え。
+            // LibreHardwareMonitor 導入後に実装する想定
             // TemperatureText = $"CPU: {cpuTemp:F0} °C / GPU: {gpuTemp:F0} °C";
         }
 
-        // ===== メモリ（GlobalMemoryStatusEx）=====
+        // ==== Topプロセス（GPU あり）====
+        private void EnsureGpuPerEngineCounters()
+        {
+            if (_gpuPerEngine.Count > 0) return;
+            try
+            {
+                var cat = new PerformanceCounterCategory("GPU Engine");
+                foreach (var inst in cat.GetInstanceNames())
+                {
+                    if (!inst.Contains("engtype_3D")) continue;
+                    try
+                    {
+                        var pc = new PerformanceCounter("GPU Engine", "Utilization Percentage", inst, true);
+                        _gpuPerEngine.Add(pc);
+                        _ = pc.NextValue();
+                    }
+                    catch { }
+                }
+
+                // 安全弁：多すぎると重いので諦める
+                if (_gpuPerEngine.Count > 200)
+                    _gpuPerEngine.Clear();
+            }
+            catch { }
+        }
+
+        private void UpdateTopProcesses()
+        {
+            try
+            {
+                EnsureGpuPerEngineCounters();
+
+                // GPU% を pid ごとに合算
+                var gpuByPid = new Dictionary<int, float>();
+                foreach (var pc in _gpuPerEngine)
+                {
+                    try
+                    {
+                        float v = pc.NextValue();
+                        var m = _pidRegex.Match(pc.InstanceName);
+                        if (!m.Success) continue;
+                        int pid = int.Parse(m.Groups[1].Value);
+                        if (!gpuByPid.ContainsKey(pid)) gpuByPid[pid] = 0f;
+                        gpuByPid[pid] += v;
+                    }
+                    catch { }
+                }
+
+                var now = DateTime.UtcNow;
+                var procs = Process.GetProcesses();
+                var rows = new List<ProcRow>(procs.Length);
+
+                foreach (var p in procs)
+                {
+                    try
+                    {
+                        // CPU%
+                        var cpu = p.TotalProcessorTime;
+                        float cpuPct = 0f;
+                        if (_prevCpu.TryGetValue(p.Id, out var prev))
+                        {
+                            var dt = (float)(now - prev.ts).TotalSeconds;
+                            if (dt > 0.2f)
+                            {
+                                var dcpu = (float)(cpu - prev.cpuTime).TotalSeconds;
+                                cpuPct = Math.Clamp((dcpu / dt) * 100f / _logicalProcessorCount, 0f, 1000f);
+                            }
+                        }
+                        _prevCpu[p.Id] = (cpu, now);
+
+                        // Mem(MB)
+                        float memMB = p.WorkingSet64 / (1024f * 1024f);
+
+                        // GPU%
+                        gpuByPid.TryGetValue(p.Id, out float gpuPct);
+
+                        rows.Add(new ProcRow
+                        {
+                            Name = string.IsNullOrEmpty(p.ProcessName) ? "(unknown)" : p.ProcessName,
+                            Pid = p.Id,
+                            CpuPct = cpuPct,
+                            MemMB = memMB,
+                            GpuPct = gpuPct
+                        });
+                    }
+                    catch { }
+                }
+
+                var top = rows
+                    .OrderByDescending(r => r.CpuPct)
+                    .ThenByDescending(r => r.GpuPct)
+                    .ThenByDescending(r => r.MemMB)
+                    .Take(5)
+                    .ToList();
+
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    TopProcs.Clear();
+                    foreach (var r in top) TopProcs.Add(r);
+                });
+
+                // 終了したPIDのキャッシュ掃除
+                var alive = new HashSet<int>(procs.Select(p => p.Id));
+                var dead = _prevCpu.Keys.Where(pid => !alive.Contains(pid)).ToList();
+                foreach (var d in dead) _prevCpu.Remove(d);
+            }
+            catch { }
+        }
+
+        // ==== Topプロセス（GPU なしの軽量版）====
+        private void UpdateTopProcesses_NoGpu()
+        {
+            try
+            {
+                var now = DateTime.UtcNow;
+                var procs = Process.GetProcesses();
+                var rows = new List<ProcRow>(procs.Length);
+
+                foreach (var p in procs)
+                {
+                    try
+                    {
+                        var cpu = p.TotalProcessorTime;
+                        float cpuPct = 0f;
+                        if (_prevCpu.TryGetValue(p.Id, out var prev))
+                        {
+                            var dt = (float)(now - prev.ts).TotalSeconds;
+                            if (dt > 0.2f)
+                            {
+                                var dcpu = (float)(cpu - prev.cpuTime).TotalSeconds;
+                                cpuPct = Math.Clamp((dcpu / dt) * 100f / _logicalProcessorCount, 0f, 1000f);
+                            }
+                        }
+                        _prevCpu[p.Id] = (cpu, now);
+
+                        float memMB = p.WorkingSet64 / (1024f * 1024f);
+
+                        rows.Add(new ProcRow
+                        {
+                            Name = string.IsNullOrEmpty(p.ProcessName) ? "(unknown)" : p.ProcessName,
+                            Pid = p.Id,
+                            CpuPct = cpuPct,
+                            MemMB = memMB,
+                            GpuPct = 0f
+                        });
+                    }
+                    catch { }
+                }
+
+                var top = rows
+                    .OrderByDescending(r => r.CpuPct)
+                    .ThenByDescending(r => r.MemMB)
+                    .Take(5)
+                    .ToList();
+
+                Application.Current.Dispatcher.Invoke(() =>
+                {
+                    TopProcs.Clear();
+                    foreach (var r in top) TopProcs.Add(r);
+                });
+
+                var alive = new HashSet<int>(procs.Select(p => p.Id));
+                var dead = _prevCpu.Keys.Where(pid => !alive.Contains(pid)).ToList();
+                foreach (var d in dead) _prevCpu.Remove(d);
+            }
+            catch { }
+        }
+
+        // ==== メモリ（GlobalMemoryStatusEx）====
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private struct MEMORYSTATUSEX
         {
@@ -320,20 +392,20 @@ namespace task_handler
             return (used, total, pct);
         }
 
-        // ===== INotifyPropertyChanged =====
+        // ==== INotifyPropertyChanged ====
         public event PropertyChangedEventHandler? PropertyChanged;
         private void OnPropertyChanged([CallerMemberName] string? name = null)
             => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
+        // ==== IDisposable ====
         public void Dispose()
         {
             _timer?.Stop();
             _timer?.Dispose();
             _cpuTotal?.Dispose();
             foreach (var pc in _gpuCounters) pc.Dispose();
+            foreach (var pc in _gpuPerEngine) pc.Dispose();
             _ping?.Dispose();
-
-            // _pc?.Close();
         }
     }
 }
